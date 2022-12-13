@@ -3,6 +3,8 @@ import socket
 from cryptography.fernet import Fernet
 import os
 
+#test
+
 if os.path.exists("secret.key"):
     with open("secret.key", "rb") as key_file:
         key = key_file.read()
