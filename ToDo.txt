@@ -1,0 +1,15 @@
+1. Kolla om användarnamn är upptaget.
+
+2. skriva till alla om någon lämna.
+
+3. Servern ska säga vilken tid ett meddelande skickades.
+
+4. kommandon från servern.
+/stop
+/kick namn
+/silence
+/silence namn
+/pause
+/clean or /reset
+
+5. Servern ska kunna skriva till alla.
