@@ -1,1 +1,7 @@
 secret.key
+# Build artifacts
+build/
+dist/
+out/
+bin/
+obj/
