@@ -7,6 +7,8 @@ import os
 import datetime
 import sys
 from msvcrt import getch
+import colorama
+colorama.init(autoreset=True)
 
 users = []
 usernames = ['Server']

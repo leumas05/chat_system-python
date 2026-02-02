@@ -5,6 +5,8 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes, serialization
 import sys
 import os
+import colorama
+colorama.init(autoreset=True)
 
 # Prompt user for server IP and port
 print("\033[36m=== Connect to Server ===\033[0m")
