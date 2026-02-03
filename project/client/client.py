@@ -10,16 +10,34 @@ colorama.init(autoreset=True)
 
 # Prompt user for server IP and port
 print("\033[36m=== Connect to Server ===\033[0m")
-HOST = input("Enter server IP address (e.g., 127.0.0.1 or 192.168.x.x): ").strip()
-while True:
+HOST = input("Enter server IP address (e.g., 127.0.0.1 or 192.168.x.x:63592): ").strip()
+
+# Check if port is included in the IP address
+if ':' in HOST:
   try:
-    PORT = int(input("Enter server port: ").strip())
-    if 1 <= PORT <= 65535:
-      break
-    else:
+    ip_part, port_part = HOST.rsplit(':', 1)
+    PORT = int(port_part)
+    HOST = ip_part
+    if not (1 <= PORT <= 65535):
       print("\033[31mPort must be between 1 and 65535\033[0m")
+      PORT = None
   except ValueError:
-    print("\033[31mPlease enter a valid number\033[0m")
+    print("\033[31mInvalid port in address, please enter port separately\033[0m")
+    PORT = None
+else:
+  PORT = None
+
+# If port wasn't provided or was invalid, ask for it
+if PORT is None:
+  while True:
+    try:
+      PORT = int(input("Enter server port: ").strip())
+      if 1 <= PORT <= 65535:
+        break
+      else:
+        print("\033[31mPort must be between 1 and 65535\033[0m")
+    except ValueError:
+      print("\033[31mPlease enter a valid number\033[0m")
 
 print(f"\033[36mConnecting to {HOST}:{PORT}...\033[0m\n")
 
