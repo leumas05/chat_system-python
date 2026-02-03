@@ -284,17 +284,19 @@ HOST = "0.0.0.0"  # Listen on all network interfaces
 PORT = 0  # Let OS choose an available port automatically
 
 def broadcast(message, sender):
+  # Copy user list while holding lock to avoid blocking other operations during sends
   with users_lock:
-    for user in users:
-      if user != sender:
-        cipher = client_ciphers.get(user)
-        if cipher:
-          try:
-            encrypted_message = cipher.encrypt(message.encode())
-            user.send(encrypted_message)
-          except:
-            # Silently ignore if send fails (user disconnected)
-            pass
+    users_to_send = [(user, client_ciphers.get(user)) for user in users if user != sender]
+  
+  # Send to users outside the lock (socket operations can block)
+  for user, cipher in users_to_send:
+    if cipher:
+      try:
+        encrypted_message = cipher.encrypt(message.encode())
+        user.send(encrypted_message)
+      except:
+        # Silently ignore if send fails (user disconnected)
+        pass
 
 
 def handle_client(client):
