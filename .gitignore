@@ -7,3 +7,4 @@ bin/
 obj/
 *.spec
 *.pem
+py2exe.txt
