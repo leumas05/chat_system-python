@@ -6,3 +6,4 @@ out/
 bin/
 obj/
 *.spec
+*.pem
