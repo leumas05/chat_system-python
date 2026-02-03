@@ -233,14 +233,6 @@ Username accepted → Join chat
 - Rate limit triggered (20 msg/min default)
 - Wait a moment before sending more
 
-## License
-
-See LICENSE file for details.
-
-## Contributing
-
-This is a learning/demonstration project showcasing secure chat architecture. Contributions welcome!
-
 ## Security Notes
 
 ⚠️ **For Educational/Internal Use**: While this system implements many security best practices, it's designed for learning and internal networks, not production internet-facing deployments.

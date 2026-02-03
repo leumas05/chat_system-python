@@ -34,8 +34,8 @@ banned_usernames = set()  # Store banned usernames (survives IP changes)
 reserved_usernames = {'Server', 'Admin', 'Administrator', 'System', 'Moderator', 'Mod', 'Owner', 'Root'}  # Reserved usernames
 silenced_ips = {}  # Store silenced IP addresses with username {ip: username}
 server_input = [""]
-client_message_times = {}  # Store message timestamps for rate limiting {client: [timestamps]}
-user_accounts = {}  # Store username:password pairs {username: hashed_password}
+client_message_times = {}  # Store message timestamps for rate limiting {username: [timestamps]}
+user_accounts = {}  # Store username:password pairs {username: (salt, hashed_password)}
 username_ip_history = {}  # Track username-IP pairs to detect ban evasion {username: [ips]}
 ip_username_count = {}  # Count unique usernames per IP {ip: set(usernames)}
 
@@ -43,6 +43,7 @@ ip_username_count = {}  # Count unique usernames per IP {ip: set(usernames)}
 connection_semaphore = threading.Semaphore(MAX_CONNECTIONS)
 active_connections = 0
 connections_lock = threading.Lock()
+users_lock = threading.Lock()  # Protect users, usernames, and client data from concurrent modification
 
 # Load banned IPs from file
 BAN_FILE = "banned_ips.txt"
@@ -73,9 +74,16 @@ if os.path.exists(ACCOUNTS_FILE):
     with open(ACCOUNTS_FILE, "r") as f:
         for line in f:
             parts = line.strip().split("|")
-            if len(parts) == 2:
+            if len(parts) == 3:  # New format: username|salt|hash
+                username, salt_hex, password_hash = parts
+                user_accounts[username] = (bytes.fromhex(salt_hex), password_hash)
+            elif len(parts) == 2:  # Old format (migrate to new format)
                 username, password_hash = parts
-                user_accounts[username] = password_hash
+                # Generate a random salt for existing accounts
+                salt = os.urandom(32)
+                # Keep old hash but add salt (will force password reset on next login)
+                user_accounts[username] = (salt, password_hash)
+                print(f"  ⚠ Account '{username}' needs migration (old format detected)")
     print(f"Loaded {len(user_accounts)} registered account(s) from {ACCOUNTS_FILE}")
 
 # Load reserved usernames from file (optional, adds to defaults)
@@ -122,8 +130,9 @@ def save_silenced_ips():
 def save_user_accounts():
     """Save user accounts to file"""
     with open(ACCOUNTS_FILE, "w") as f:
-        for username, password_hash in sorted(user_accounts.items()):
-            f.write(f"{username}|{password_hash}\n")
+        for username, (salt, password_hash) in sorted(user_accounts.items()):
+            salt_hex = salt.hex()
+            f.write(f"{username}|{salt_hex}|{password_hash}\n")
 
 def save_reserved_usernames():
     """Save reserved usernames to file"""
@@ -144,26 +153,26 @@ def sanitize_message(text):
     
     return text
 
-def is_rate_limited(client):
-    """Check if client is sending messages too fast (DoS protection)"""
+def is_rate_limited(username):
+    """Check if user is sending messages too fast (DoS protection)"""
     current_time = time.time()
     
-    # Initialize message times for new client
-    if client not in client_message_times:
-        client_message_times[client] = []
+    # Initialize message times for new user
+    if username not in client_message_times:
+        client_message_times[username] = []
     
     # Remove timestamps older than MESSAGE_WINDOW
-    client_message_times[client] = [
-        t for t in client_message_times[client]
+    client_message_times[username] = [
+        t for t in client_message_times[username]
         if current_time - t < MESSAGE_WINDOW
     ]
     
     # Check if limit exceeded
-    if len(client_message_times[client]) >= MAX_MESSAGES_PER_MINUTE:
+    if len(client_message_times[username]) >= MAX_MESSAGES_PER_MINUTE:
         return True
     
     # Add current timestamp
-    client_message_times[client].append(current_time)
+    client_message_times[username].append(current_time)
     return False
 
 def check_suspicious_activity(username, ip):
@@ -202,27 +211,59 @@ def check_suspicious_activity(username, ip):
 # Load or generate RSA key pair for secure key exchange
 KEY_FILE = "server_key.pem"
 if os.path.exists(KEY_FILE):
-    # Load existing key
-    with open(KEY_FILE, "rb") as f:
-        private_key = serialization.load_pem_private_key(
-            f.read(),
-            password=None
-        )
-    print(f"Loaded existing server key from {KEY_FILE}")
+    # Load existing key (requires password)
+    print("\n\033[33mServer private key is password-protected\033[0m")
+    while True:
+        key_password = input("Enter key password to unlock server: ").strip()
+        if not key_password:
+            print("\033[31mPassword cannot be empty\033[0m")
+            continue
+        try:
+            with open(KEY_FILE, "rb") as f:
+                private_key = serialization.load_pem_private_key(
+                    f.read(),
+                    password=key_password.encode()
+                )
+            print(f"\033[32m✓ Server key loaded successfully\033[0m")
+            break
+        except ValueError:
+            print("\033[31m✗ Incorrect password! Try again.\033[0m")
+        except Exception as e:
+            print(f"\033[31mError loading key: {e}\033[0m")
+            sys.exit(1)
 else:
-    # Generate new RSA key pair
+    # Generate new RSA key pair with password protection
+    print("\n\033[33m=== First-Time Server Setup ===\033[0m")
+    print("\033[33mGenerating new server key...\033[0m")
+    print("\033[33mYou will need to create a password to protect the server's private key.\033[0m")
+    print("\033[33mThis password will be required every time you start the server.\033[0m\n")
+    
+    while True:
+        key_password = input("Create a password for the server key: ").strip()
+        if len(key_password) < 8:
+            print("\033[31mPassword must be at least 8 characters\033[0m")
+            continue
+        key_password_confirm = input("Confirm password: ").strip()
+        if key_password != key_password_confirm:
+            print("\033[31mPasswords do not match! Try again.\033[0m")
+            continue
+        break
+    
     private_key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048,
     )
-    # Save the private key
+    
+    # Save the private key with password encryption
     with open(KEY_FILE, "wb") as f:
         f.write(private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
+            encryption_algorithm=serialization.BestAvailableEncryption(key_password.encode())
         ))
-    print(f"Generated new server key and saved to {KEY_FILE}")
+    
+    print(f"\033[32m✓ Generated new password-protected server key and saved to {KEY_FILE}\033[0m")
+    print(f"\033[33m⚠ IMPORTANT: Remember this password! You cannot start the server without it.\033[0m\n")
 
 public_key = private_key.public_key()
 
@@ -243,12 +284,17 @@ HOST = "0.0.0.0"  # Listen on all network interfaces
 PORT = 0  # Let OS choose an available port automatically
 
 def broadcast(message, sender):
-  for user in users:
-    if user != sender:
-      cipher = client_ciphers.get(user)
-      if cipher:
-        encrypted_message = cipher.encrypt(message.encode())
-        user.send(encrypted_message)
+  with users_lock:
+    for user in users:
+      if user != sender:
+        cipher = client_ciphers.get(user)
+        if cipher:
+          try:
+            encrypted_message = cipher.encrypt(message.encode())
+            user.send(encrypted_message)
+          except:
+            # Silently ignore if send fails (user disconnected)
+            pass
 
 
 def handle_client(client):
@@ -323,9 +369,12 @@ def handle_client(client):
       password_data = client.recv(1024)
       password = cipher.decrypt(password_data).decode()
       
-      # Verify password (simple hash comparison)
-      password_hash = hashlib.sha256(password.encode()).hexdigest()
-      if password_hash != user_accounts[username]:
+      # Verify password using PBKDF2 with stored salt
+      salt, stored_hash = user_accounts[username]
+      # Use PBKDF2-HMAC-SHA256 with 100,000 iterations (secure key derivation)
+      password_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000).hex()
+      
+      if password_hash != stored_hash:
         error_msg = cipher.encrypt(b"PASSWORD_INCORRECT")
         client.send(error_msg)
         client.close()
@@ -347,9 +396,11 @@ def handle_client(client):
     # Send final confirmation that username is accepted
     client.send(cipher.encrypt(b"USERNAME_OK"))
     
-    usernames.append(username)
-    users.append(client)
-    client_addresses[client] = address
+    with users_lock:
+      usernames.append(username)
+      users.append(client)
+      client_addresses[client] = address
+    
     print(str(datetime.datetime.now())+":  \033[32mNew client user: \33[0m\33[36m\"{}\"\33[0m\033[32m with the ip:\33[0m {}".format(username,address))
     broadcast("User: \33[36m\"{}\"\33[0m joined".format(username), client)
     while True:
@@ -363,8 +414,8 @@ def handle_client(client):
         # Sanitize message to prevent ANSI injection and UI spoofing
         message = sanitize_message(message)
         
-        # Check rate limiting to prevent message flooding
-        if is_rate_limited(client):
+        # Check rate limiting to prevent message flooding (by username, not socket)
+        if is_rate_limited(username):
           # Warn the user they're sending too fast
           warning = cipher.encrypt("\033[33mYou are sending messages too fast. Please slow down.\033[0m".encode())
           try:
@@ -387,15 +438,16 @@ def handle_client(client):
         break
       except Exception as e:
         print(str(datetime.datetime.now())+":  \033[31mUser: \033[0m\33[36m\"{}\"\33[0m\033[31m left. Ip: \033[0m{}".format(username, address))
-        usernames.remove(username)
+        with users_lock:
+          usernames.remove(username)
+          users.remove(client)
+          if client in client_ciphers:
+            del client_ciphers[client]
+          if client in client_addresses:
+            del client_addresses[client]
+          if username in client_message_times:
+            del client_message_times[username]
         broadcast("User: \33[36m\"{}\"\33[0m left".format(username), client)
-        users.remove(client)
-        if client in client_ciphers:
-          del client_ciphers[client]
-        if client in client_addresses:
-          del client_addresses[client]
-        if client in client_message_times:
-          del client_message_times[client]
         client.close()
         break
   except socket.timeout:
@@ -404,16 +456,14 @@ def handle_client(client):
       del client_ciphers[client]
     if client in client_addresses:
       del client_addresses[client]
-    if client in client_message_times:
-      del client_message_times[client]
+    # Note: username not set yet during handshake timeout
   except Exception as e:
     print(str(datetime.datetime.now())+":  \033[31mSomeone without a username left!\033[0m Ip: {}".format(address))
     if client in client_ciphers:
       del client_ciphers[client]
     if client in client_addresses:
       del client_addresses[client]
-    if client in client_message_times:
-      del client_message_times[client]
+    # Note: username not set yet, can't clean client_message_times
   finally:
     # Release semaphore slot
     with connections_lock:
@@ -439,8 +489,9 @@ print(f"  Port: {actual_port}")
 print("\033[36m==============================\033[0m\n")
 
 def kick_all_clients():
-  for client in users:
-    client.close()
+  with users_lock:
+    for client in users:
+      client.close()
     
 def input_thread():
   while True:
@@ -473,12 +524,13 @@ def input_thread():
       print("  Any other message will be broadcast to all users")
       print("\033[36m=======================\033[0m")
     elif server_input == "/list":
-      print("\033[36m=== Connected Users ===\033[0m")
-      for i, client in enumerate(users):
-        username = usernames[i+1] if i+1 < len(usernames) else "Unknown"
-        ip_address = client_addresses.get(client, "Unknown")
-        print(f"  \33[36m{username}\33[0m - {ip_address}")
-      print(f"\033[36mTotal: {len(users)} users\033[0m")
+      with users_lock:
+        print("\033[36m=== Connected Users ===\033[0m")
+        for i, client in enumerate(users):
+          username = usernames[i+1] if i+1 < len(usernames) else "Unknown"
+          ip_address = client_addresses.get(client, "Unknown")
+          print(f"  \33[36m{username}\33[0m - {ip_address}")
+        print(f"\033[36mTotal: {len(users)} users\033[0m")
     elif server_input == "/list-ban":
       if banned_ips:
         print("\033[36m=== Banned IP Addresses ===\033[0m")
@@ -521,76 +573,78 @@ def input_thread():
         print("\033[36mNo silenced users\033[0m")
     elif server_input.startswith("/kick "):
       username_to_kick = server_input[6:].strip()
-      if username_to_kick in usernames:
-        # Find the client with this username
-        index = usernames.index(username_to_kick)
-        client_to_kick = users[index]
-        
-        # Notify the user they're being kicked
-        cipher = client_ciphers.get(client_to_kick)
-        if cipher:
-          try:
-            kick_msg = cipher.encrypt("\033[31mYou have been kicked by the server\033[0m".encode())
-            client_to_kick.send(kick_msg)
-          except:
-            pass
-        
-        # Remove from lists and close connection
-        usernames.remove(username_to_kick)
-        users.remove(client_to_kick)
-        if client_to_kick in client_ciphers:
-          del client_ciphers[client_to_kick]
-        if client_to_kick in client_addresses:
-          del client_addresses[client_to_kick]
-        client_to_kick.close()
-        
-        # Broadcast and log
-        broadcast("User: \33[36m\"{}\"\33[0m was kicked".format(username_to_kick), server)
-        print(str(datetime.datetime.now())+": \033[31mKicked user: \033[0m\33[36m\"{}\"\33[0m".format(username_to_kick))
-      else:
-        print("\033[31mUser '{}' not found\033[0m".format(username_to_kick))
-    elif server_input.startswith("/ban "):
-      username_to_ban = server_input[5:].strip()
-      if username_to_ban in usernames:
-        # Find the client with this username
-        index = usernames.index(username_to_ban)
-        client_to_ban = users[index]
-        ip_to_ban = client_addresses.get(client_to_ban)
-        
-        if ip_to_ban:
-          # Add IP to banned list with username
-          banned_ips[ip_to_ban[0]] = username_to_ban  # Store IP with username
-          save_banned_ips()  # Persist to file
+      with users_lock:
+        if username_to_kick in usernames:
+          # Find the client with this username
+          index = usernames.index(username_to_kick)
+          client_to_kick = users[index]
           
-          # Also ban the username to prevent reconnection from different IP
-          banned_usernames.add(username_to_ban)
-          save_banned_usernames()
-          
-          # Notify the user they're being banned
-          cipher = client_ciphers.get(client_to_ban)
+          # Notify the user they're being kicked
+          cipher = client_ciphers.get(client_to_kick)
           if cipher:
             try:
-              ban_msg = cipher.encrypt("\033[31mYou have been banned from the server\033[0m".encode())
-              client_to_ban.send(ban_msg)
+              kick_msg = cipher.encrypt("\033[31mYou have been kicked by the server\033[0m".encode())
+              client_to_kick.send(kick_msg)
             except:
               pass
           
           # Remove from lists and close connection
-          usernames.remove(username_to_ban)
-          users.remove(client_to_ban)
-          if client_to_ban in client_ciphers:
-            del client_ciphers[client_to_ban]
-          if client_to_ban in client_addresses:
-            del client_addresses[client_to_ban]
-          client_to_ban.close()
+          usernames.remove(username_to_kick)
+          users.remove(client_to_kick)
+          if client_to_kick in client_ciphers:
+            del client_ciphers[client_to_kick]
+          if client_to_kick in client_addresses:
+            del client_addresses[client_to_kick]
+          client_to_kick.close()
           
-          # Broadcast and log
-          broadcast("User: \33[36m\"{}\"\33[0m was banned".format(username_to_ban), server)
-          print(str(datetime.datetime.now())+": \033[31mBanned user: \033[0m\33[36m\"{}\"\33[0m (IP: {})".format(username_to_ban, ip_to_ban[0]))
+          # Broadcast and log (outside lock to avoid deadlock)
+          broadcast("User: \33[36m\"{}\"\33[0m was kicked".format(username_to_kick), server)
+          print(str(datetime.datetime.now())+": \033[31mKicked user: \033[0m\33[36m\"{}\"\33[0m".format(username_to_kick))
         else:
-          print("\033[31mCould not retrieve IP address\033[0m")
-      else:
-        print("\033[31mUser '{}' not found\033[0m".format(username_to_ban))
+          print("\033[31mUser '{}' not found\033[0m".format(username_to_kick))
+    elif server_input.startswith("/ban "):
+      username_to_ban = server_input[5:].strip()
+      with users_lock:
+        if username_to_ban in usernames:
+          # Find the client with this username
+          index = usernames.index(username_to_ban)
+          client_to_ban = users[index]
+          ip_to_ban = client_addresses.get(client_to_ban)
+          
+          if ip_to_ban:
+            # Add IP to banned list with username
+            banned_ips[ip_to_ban[0]] = username_to_ban  # Store IP with username
+            save_banned_ips()  # Persist to file
+            
+            # Also ban the username to prevent reconnection from different IP
+            banned_usernames.add(username_to_ban)
+            save_banned_usernames()
+            
+            # Notify the user they're being banned
+            cipher = client_ciphers.get(client_to_ban)
+            if cipher:
+              try:
+                ban_msg = cipher.encrypt("\033[31mYou have been banned from the server\033[0m".encode())
+                client_to_ban.send(ban_msg)
+              except:
+                pass
+            
+            # Remove from lists and close connection
+            usernames.remove(username_to_ban)
+            users.remove(client_to_ban)
+            if client_to_ban in client_ciphers:
+              del client_ciphers[client_to_ban]
+            if client_to_ban in client_addresses:
+              del client_addresses[client_to_ban]
+            client_to_ban.close()
+            
+            # Broadcast and log
+            broadcast("User: \33[36m\"{}\"\33[0m was banned".format(username_to_ban), server)
+            print(str(datetime.datetime.now())+": \033[31mBanned user: \033[0m\33[36m\"{}\"\33[0m (IP: {})".format(username_to_ban, ip_to_ban[0]))
+          else:
+            print("\033[31mCould not retrieve IP address\033[0m")
+        else:
+          print("\033[31mUser '{}' not found\033[0m".format(username_to_ban))
     elif server_input.startswith("/unban "):
       ip_to_unban = server_input[7:].strip()
       if ip_to_unban in banned_ips:
@@ -606,24 +660,25 @@ def input_thread():
       save_banned_usernames()
       
       # Kick if currently connected
-      if username_to_ban in usernames:
-        index = usernames.index(username_to_ban)
-        client_to_ban = users[index]
-        cipher = client_ciphers.get(client_to_ban)
-        if cipher:
-          try:
-            ban_msg = cipher.encrypt("\033[31mYour username has been permanently banned\033[0m".encode())
-            client_to_ban.send(ban_msg)
-          except:
-            pass
-        usernames.remove(username_to_ban)
-        users.remove(client_to_ban)
-        if client_to_ban in client_ciphers:
-          del client_ciphers[client_to_ban]
-        if client_to_ban in client_addresses:
-          del client_addresses[client_to_ban]
-        client_to_ban.close()
-        broadcast("User: \33[36m\"{}\"\33[0m was banned".format(username_to_ban), server)
+      with users_lock:
+        if username_to_ban in usernames:
+          index = usernames.index(username_to_ban)
+          client_to_ban = users[index]
+          cipher = client_ciphers.get(client_to_ban)
+          if cipher:
+            try:
+              ban_msg = cipher.encrypt("\033[31mYour username has been permanently banned\033[0m".encode())
+              client_to_ban.send(ban_msg)
+            except:
+              pass
+          usernames.remove(username_to_ban)
+          users.remove(client_to_ban)
+          if client_to_ban in client_ciphers:
+            del client_ciphers[client_to_ban]
+          if client_to_ban in client_addresses:
+            del client_addresses[client_to_ban]
+          client_to_ban.close()
+          broadcast("User: \33[36m\"{}\"\33[0m was banned".format(username_to_ban), server)
       
       print(str(datetime.datetime.now())+": \033[31mBanned username: \033[0m\033[36m{}\033[0m".format(username_to_ban))
     elif server_input.startswith("/unban-user "):
@@ -638,10 +693,13 @@ def input_thread():
       parts = server_input[10:].strip().split(" ", 1)
       if len(parts) == 2:
         username, password = parts
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-        user_accounts[username] = password_hash
+        # Generate a cryptographically secure random salt (32 bytes)
+        salt = os.urandom(32)
+        # Use PBKDF2-HMAC-SHA256 with 100,000 iterations (resistant to rainbow tables)
+        password_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000).hex()
+        user_accounts[username] = (salt, password_hash)
         save_user_accounts()
-        print(str(datetime.datetime.now())+": \033[32mRegistered account: \033[0m\033[36m{}\033[0m".format(username))
+        print(str(datetime.datetime.now())+": \033[32mRegistered account: \033[0m\033[36m{}\033[0m \033[90m(PBKDF2 with salt)\033[0m".format(username))
       else:
         print("\033[31mUsage: /register <username> <password>\033[0m")
     elif server_input.startswith("/unregister "):
@@ -658,24 +716,25 @@ def input_thread():
       save_reserved_usernames()
       
       # Kick if currently connected
-      if username in usernames:
-        index = usernames.index(username)
-        client_to_kick = users[index]
-        cipher = client_ciphers.get(client_to_kick)
-        if cipher:
-          try:
-            msg = cipher.encrypt("\033[33mYour username has been reserved by the server\033[0m".encode())
-            client_to_kick.send(msg)
-          except:
-            pass
-        usernames.remove(username)
-        users.remove(client_to_kick)
-        if client_to_kick in client_ciphers:
-          del client_ciphers[client_to_kick]
-        if client_to_kick in client_addresses:
-          del client_addresses[client_to_kick]
-        client_to_kick.close()
-        broadcast("User: \33[36m\"{}\"\33[0m was disconnected (username reserved)".format(username), server)
+      with users_lock:
+        if username in usernames:
+          index = usernames.index(username)
+          client_to_kick = users[index]
+          cipher = client_ciphers.get(client_to_kick)
+          if cipher:
+            try:
+              msg = cipher.encrypt("\033[33mYour username has been reserved by the server\033[0m".encode())
+              client_to_kick.send(msg)
+            except:
+              pass
+          usernames.remove(username)
+          users.remove(client_to_kick)
+          if client_to_kick in client_ciphers:
+            del client_ciphers[client_to_kick]
+          if client_to_kick in client_addresses:
+            del client_addresses[client_to_kick]
+          client_to_kick.close()
+          broadcast("User: \33[36m\"{}\"\33[0m was disconnected (username reserved)".format(username), server)
       
       print(str(datetime.datetime.now())+": \033[35mReserved username: \033[0m\033[36m{}\033[0m".format(username))
     elif server_input.startswith("/unreserve "):
@@ -692,31 +751,32 @@ def input_thread():
         print("\033[31mUsername '{}' is not reserved\033[0m".format(username))
     elif server_input.startswith("/silence "):
       username_to_silence = server_input[9:].strip()
-      if username_to_silence in usernames:
-        # Find the client with this username
-        index = usernames.index(username_to_silence)
-        client_to_silence = users[index]
-        ip_to_silence = client_addresses.get(client_to_silence)
-        
-        if ip_to_silence:
-          # Add IP to silenced list
-          silenced_ips[ip_to_silence[0]] = username_to_silence
-          save_silenced_ips()
+      with users_lock:
+        if username_to_silence in usernames:
+          # Find the client with this username
+          index = usernames.index(username_to_silence)
+          client_to_silence = users[index]
+          ip_to_silence = client_addresses.get(client_to_silence)
           
-          # Notify the user they're being silenced
-          cipher = client_ciphers.get(client_to_silence)
-          if cipher:
-            try:
-              silence_msg = cipher.encrypt("\033[33mYou have been silenced by the server\033[0m".encode())
-              client_to_silence.send(silence_msg)
-            except:
-              pass
-          
-          print(str(datetime.datetime.now())+": \033[33mSilenced user: \033[0m\33[36m\"{}\"\33[0m (IP: {})".format(username_to_silence, ip_to_silence[0]))
+          if ip_to_silence:
+            # Add IP to silenced list
+            silenced_ips[ip_to_silence[0]] = username_to_silence
+            save_silenced_ips()
+            
+            # Notify the user they're being silenced
+            cipher = client_ciphers.get(client_to_silence)
+            if cipher:
+              try:
+                silence_msg = cipher.encrypt("\033[33mYou have been silenced by the server\033[0m".encode())
+                client_to_silence.send(silence_msg)
+              except:
+                pass
+            
+            print(str(datetime.datetime.now())+": \033[33mSilenced user: \033[0m\33[36m\"{}\"\33[0m (IP: {})".format(username_to_silence, ip_to_silence[0]))
+          else:
+            print("\033[31mCould not retrieve IP address\033[0m")
         else:
-          print("\033[31mCould not retrieve IP address\033[0m")
-      else:
-        print("\033[31mUser '{}' not found\033[0m".format(username_to_silence))
+          print("\033[31mUser '{}' not found\033[0m".format(username_to_silence))
     elif server_input.startswith("/desilence "):
       username_to_desilence = server_input[11:].strip()
       # Find IP by username in silenced_ips
@@ -731,16 +791,17 @@ def input_thread():
         save_silenced_ips()
         
         # Notify the user if they're still connected
-        if username_to_desilence in usernames:
-          index = usernames.index(username_to_desilence)
-          client = users[index]
-          cipher = client_ciphers.get(client)
-          if cipher:
-            try:
-              desilence_msg = cipher.encrypt("\033[32mYou have been unsilenced\033[0m".encode())
-              client.send(desilence_msg)
-            except:
-              pass
+        with users_lock:
+          if username_to_desilence in usernames:
+            index = usernames.index(username_to_desilence)
+            client = users[index]
+            cipher = client_ciphers.get(client)
+            if cipher:
+              try:
+                desilence_msg = cipher.encrypt("\033[32mYou have been unsilenced\033[0m".encode())
+                client.send(desilence_msg)
+              except:
+                pass
         
         print(str(datetime.datetime.now())+": \033[32mUnsilenced user: \033[0m\33[36m\"{}\"\33[0m (IP: {})".format(username_to_desilence, ip_found))
       else:
